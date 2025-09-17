@@ -1,10 +1,16 @@
-FROM quay.io/qasimtech/mega-bot:latest
+FROM node:lts-buster
 
-RUN git clone https://github.com/GlobalTechInfo/MEGA-AI /root/mega && \
-    rm -rf /root/mega/.git
+# Set working directory
+WORKDIR /app
 
-WORKDIR /root/mega
-RUN npm install || yarn install
+# Copy all local files to container
+COPY . .
 
-EXPOSE 5000
+# Install dependencies
+RUN npm install && npm install -g pm2
+
+# Expose the port your app listens on
+EXPOSE 9090
+
+# Start the app
 CMD ["npm", "start"]
