@@ -78,8 +78,6 @@ setInterval(async () => {
 
 await global.loadDatabase()
 
-const phoneNumberFromEnv = process.env.BOT_NUMBER
-
 const MAIN_LOGGER = pino({ timestamp: () => `,"time":"${new Date().toJSON()}"` })
 
 const logger = MAIN_LOGGER.child({})
@@ -112,8 +110,35 @@ global.prefix = new RegExp(
 )
 global.opts['db'] = process.env.MONGODB_URI
 
+// Session ID authentication logic
+let sessionAuth = null;
+const SESSION_ID = process.env.SESSION_ID;
+
+if (SESSION_ID && SESSION_ID.startsWith('EDITH-MD~')) {
+  try {
+    // Remove the EDITH-MD~ prefix and decode the base64 session
+    const base64Session = SESSION_ID.replace('EDITH-MD~', '');
+    const decodedSession = Buffer.from(base64Session, 'base64').toString('utf-8');
+    
+    // Parse the session data (assuming it's JSON formatted)
+    sessionAuth = JSON.parse(decodedSession);
+    console.log(chalk.green('✓ Session loaded successfully from SESSION_ID'));
+  } catch (error) {
+    console.log(chalk.red('✗ Failed to parse SESSION_ID:'), error.message);
+    process.exit(1);
+  }
+}
 
 const { state, saveCreds, closeConnection } = await useMongoDBAuthState(MONGODB_URI, DB_NAME)
+
+// If we have a session from SESSION_ID, use it instead of MongoDB auth
+if (sessionAuth) {
+  // Override the state with the session data
+  state.creds = sessionAuth.creds || state.creds;
+  state.keys = sessionAuth.keys || state.keys;
+  
+  console.log(chalk.blue('Using session authentication from SESSION_ID'));
+}
 
 const connectionOptions = {
   logger: Pino({
@@ -181,81 +206,27 @@ global.conn = makeWASocket(connectionOptions)
 conn.isInit = false
 
 if (!conn.authState.creds.registered) {
-  let phoneNumber
-  
-  if (phoneNumberFromEnv) {
-    phoneNumber = phoneNumberFromEnv.replace(/[^0-9]/g, '')
-    
-    if (!phoneNumber || phoneNumber.length < 8) {
-      console.log(
-        chalk.bgBlack(chalk.redBright("Invalid phone number format. Please include country code (Example: 92xxx)"))
-      )
-      if (process.send) {
-        process.send({ 
-          type: 'pairing-code', 
-          code: 'ERROR: Invalid phone number format', 
-          error: true 
-        })
-      }
-      process.exit(0)
-    }
-  } else {
-    console.log(chalk.red("No phone number provided. Please set the BOT_NUMBER environment variable."))
+  if (SESSION_ID && SESSION_ID.startsWith('EDITH-MD~')) {
+    console.log(chalk.red('✗ Invalid session: Session is not registered'));
     if (process.send) {
       process.send({ 
-        type: 'pairing-code', 
-        code: 'ERROR: No phone number provided', 
-        error: true 
+        type: 'connection-status', 
+        error: 'Invalid session: Session is not registered',
+        connected: false 
       })
     }
-    process.exit(0)
-  }
-  // Log info before starting
-conn.logger.info('\nWaiting For Login\n');
-
-// Wait 3 seconds before requesting pairing code
-setTimeout(async () => {
-  try {
-    // Request pairing code
-    let code = await conn.requestPairingCode(phoneNumber, "MEGAAI44");
-
-    // Format code like XXXX-XXXX-XXXX
-    code = code?.match(/.{1,4}/g)?.join('-') || code;
-
-    global.pairingCode = code;
-
-    // Log pairing code with colors
-    const pairingCodeFormatted = chalk.bold.greenBright('Your Pairing Code:') + ' ' + chalk.bgGreenBright(chalk.black(code));
-    console.log(pairingCodeFormatted);
-
-    // Send pairing code to parent process if applicable
+    process.exit(1);
+  } else {
+    console.log(chalk.red("No valid session provided. Please set the SESSION_ID environment variable with a valid EDITH-MD~ session."))
     if (process.send) {
       process.send({ 
-        type: 'pairing-code', 
-        code: code, 
-        error: false 
-      });
+        type: 'connection-status', 
+        error: 'No valid session provided',
+        connected: false 
+      })
     }
-
-    // Wait for 1 minute to allow user to pair
-    await new Promise(resolve => setTimeout(resolve, 60000));
-
-    // After waiting, continue with next steps here
-    // For example, start connection or listen for events
-    conn.logger.info('1 minute passed, continuing with connection...');
-
-  } catch (error) {
-    console.log(chalk.bgBlack(chalk.redBright("Failed to generate pairing code:")), error);
-
-    if (process.send) {
-      process.send({ 
-        type: 'pairing-code', 
-        code: 'ERROR: Failed to generate pairing code', 
-        error: true 
-      });
-    }
+    process.exit(1)
   }
-}, 9000);
 }
 
 if (!opts['test']) {
@@ -584,7 +555,7 @@ filesInit()
 
 global.reload = async (_ev, filename) => {
   if (pluginFilter(filename)) {
-    const dir = global.__filename(join(pluginFolder, filename), true)
+    const dir = global.__filename(join(__dirname, filename), true)
     if (filename in global.plugins) {
       if (existsSync(dir)) conn.logger.info(`\nUpdated plugin - '${filename}'`)
       else {
@@ -739,4 +710,4 @@ function formatUptime(seconds) {
 
 function padRight(text, length) {
   return String(text).padEnd(length)
-        };
+}
