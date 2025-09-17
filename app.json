@@ -12,8 +12,8 @@
       "required": true,
       "value": "923204566006"
     },
-    "BOT_NUMBER": {
-      "description": "Phone Number On Wich You will Gets Pairing Code",
+    "SESSION_ID": {
+      "description": "ENTER SESSION_ID STARTS WITH EDITH-MD~",
       "required": true,
       "value": ""
     },
