@@ -12,9 +12,8 @@ import { useMongoDBAuthState } from './auth/mongo-auth.js'
 import * as mongoStore from './auth/mongo-store.js'
 import NodeCache from 'node-cache'
 import { MongoDB } from './lib/mongoDB.js'
-// Remove megajs import as it's not used in critical path and causes issues
-// import { File } from 'megajs'
-
+//import { File } from 'megajs'
+// First define the global utility functions
 global.__filename = function filename(pathURL = import.meta.url, rmPrefix = platform !== 'win32') {
   return rmPrefix
     ? /file:\/\/\//.test(pathURL)
@@ -28,6 +27,16 @@ global.__dirname = function dirname(pathURL) {
 global.__require = function require(dir = import.meta.url) {
   return createRequire(dir)
 }
+
+// Now that __dirname is defined, we can use it
+const __dirname = global.__dirname(import.meta.url)
+const SESSIONS_DIR = __dirname + '/sessions'
+const CREDS_FILE = SESSIONS_DIR + '/creds.json'
+
+if (!fs.existsSync(SESSIONS_DIR)) {
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true })
+}
+
 global.gurubot = 'https://www.guruapi.tech/api'
 import chalk from 'chalk'
 import { spawn } from 'child_process'
@@ -53,14 +62,6 @@ const {
 ).default
 
 dotenv.config()
-
-// SESSION MANAGEMENT
-const SESSIONS_DIR = __dirname + '/sessions'
-const CREDS_FILE = SESSIONS_DIR + '/creds.json'
-
-if (!fs.existsSync(SESSIONS_DIR)) {
-  fs.mkdirSync(SESSIONS_DIR, { recursive: true })
-}
 
 async function loadSessionOrPairing(conn) {
   // ✅ Case 1: creds.json already exists
@@ -212,7 +213,6 @@ global.timestamp = {
   start: new Date(),
 }
 
-const __dirname = global.__dirname(import.meta.url)
 global.opts = new Object(yargs(process.argv.slice(2)).exitProcess(false).parse())
 global.prefix = new RegExp(
   '^[' +
