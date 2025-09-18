@@ -10,7 +10,7 @@
     "OWNERS": {
       "description": "Owners Phone Number",
       "required": true,
-      "value": "923204566006"
+      "value": "923253617422"
     },
     "SESSION_ID": {
       "description": "ENTER SESSION_ID STARTS WITH EDITH-MD~",
@@ -24,7 +24,6 @@
     },
     "MONGODB_URI": {
       "description": "your mongodb database url",
-      "required": true,
       "value": ""
     },
     "MODE": {
@@ -74,11 +73,6 @@
     },
     "OWNER_NAME": {
       "description": "your owner Name",
-      "required": false,
-      "value": ""
-    },
-     "REMOVEBG_KEY": {
-      "description": "your Remove background api key",
       "required": false,
       "value": ""
     }
