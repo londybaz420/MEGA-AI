@@ -17,10 +17,10 @@
       "required": true,
       "value": ""
     },
-    "BOTNAME": {
+    "BOT_NUMBER": {
       "description": "Give your BOT a name",
       "required": false,
-      "value": "MEGA-AI"
+      "value": ""
     },
     "MONGODB_URI": {
       "description": "your mongodb database url",
