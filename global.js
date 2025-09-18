@@ -2,7 +2,7 @@ process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '1'
 import './config.js'
 
 import dotenv from 'dotenv'
-import fs,{ existsSync, readFileSync, readdirSync, unlinkSync, watch } from 'fs'
+import fs, { existsSync, readFileSync, readdirSync, unlinkSync, watch } from 'fs'
 import { createRequire } from 'module'
 import path, { join } from 'path'
 import { platform } from 'process'
@@ -12,7 +12,8 @@ import { useMongoDBAuthState } from './auth/mongo-auth.js'
 import * as mongoStore from './auth/mongo-store.js'
 import NodeCache from 'node-cache'
 import { MongoDB } from './lib/mongoDB.js'
-import { File } from 'megajs'
+// Remove megajs import as it's not used in critical path and causes issues
+// import { File } from 'megajs'
 
 global.__filename = function filename(pathURL = import.meta.url, rmPrefix = platform !== 'win32') {
   return rmPrefix
@@ -35,7 +36,7 @@ import { default as Pino, default as pino } from 'pino'
 import syntaxerror from 'syntax-error'
 import { format } from 'util'
 import yargs from 'yargs'
-import PHONENUMBER_MCC from './lib/mcc.js';
+import PHONENUMBER_MCC from './lib/mcc.js'
 import { makeWASocket, protoType, serialize } from './lib/simple.js'
 
 const {
@@ -53,7 +54,7 @@ const {
 
 dotenv.config()
 
-//SESISON MANAGEMENT
+// SESSION MANAGEMENT
 const SESSIONS_DIR = __dirname + '/sessions'
 const CREDS_FILE = SESSIONS_DIR + '/creds.json'
 
@@ -83,26 +84,10 @@ async function loadSessionOrPairing(conn) {
       }
     }
 
-    // Case 2b: BANDAHAELI~ (Download from MEGA)
+    // Case 2b: BANDAHAELI~ (Download from MEGA) - Disabled for now due to megajs issues
     else if (process.env.SESSION_ID.startsWith("BANDAHAELI~")) {
-      try {
-        console.log("[⏳] Downloading creds data from MEGA...")
-        const megaFileId = process.env.SESSION_ID.replace("BANDAHAELI~", "")
-        const filer = File.fromURL(`https://mega.nz/file/${megaFileId}`)
-
-        const data = await new Promise((resolve, reject) => {
-          filer.download((err, data) => {
-            if (err) reject(err)
-            else resolve(data)
-          })
-        })
-
-        fs.writeFileSync(CREDS_FILE, data)
-        console.log("[✅] MEGA session downloaded successfully")
-        return true
-      } catch (error) {
-        console.error("[❌] Error loading MEGA session:", error.message)
-      }
+      console.log(chalk.yellow("⚠️ MEGA session download is temporarily disabled"))
+      // Implementation commented out due to megajs dependency issues
     }
 
     // Invalid SESSION_ID prefix
@@ -125,7 +110,7 @@ async function loadSessionOrPairing(conn) {
 
     setTimeout(async () => {
       try {
-        let code = await conn.requestPairingCode(phoneNumber, "MEGAAI44")
+        let code = await conn.requestPairingCode(phoneNumber)
         code = code?.match(/.{1,4}/g)?.join("-") || code
 
         global.pairingCode = code
@@ -158,6 +143,10 @@ async function loadSessionOrPairing(conn) {
       }
     }, 9000)
   }
+
+  return false
+}
+
 const groupMetadataCache = new NodeCache({ stdTTL: 5 * 60, useClones: false })
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017'
@@ -168,19 +157,36 @@ const globalDB = new MongoDB(MONGODB_URI)
 global.db = globalDB
 
 global.loadDatabase = async function loadDatabase() {
-  await global.db.read()
-  global.db.data = {
-    users: {},
-    chats: {},
-    settings: {},
-    stats: {},
-    ...(global.db.data || {})
+  if (global.db && typeof global.db.read === 'function') {
+    await global.db.read()
+    global.db.data = {
+      users: {},
+      chats: {},
+      settings: {},
+      stats: {},
+      ...(global.db.data || {})
+    }
+  } else {
+    console.log(chalk.yellow('⚠️ Database not available, using in-memory storage'))
+    global.db = {
+      data: {
+        users: {},
+        chats: {},
+        settings: {},
+        stats: {}
+      },
+      read: () => Promise.resolve(),
+      write: () => Promise.resolve()
+    }
   }
 }
 
-setInterval(async () => {
-  if (global.db.data) await global.db.write(global.db.data)
-}, 60 * 1000)
+// Set up interval for saving data only if db is available
+if (global.db && typeof global.db.write === 'function') {
+  setInterval(async () => {
+    if (global.db.data) await global.db.write(global.db.data)
+  }, 60 * 1000)
+}
 
 await global.loadDatabase()
 
@@ -218,8 +224,25 @@ global.prefix = new RegExp(
 )
 global.opts['db'] = process.env.MONGODB_URI
 
+// Initialize MongoDB auth state with fallback
+let authState = { creds: {}, keys: {} };
+try {
+  const mongoAuth = await useMongoDBAuthState(MONGODB_URI, DB_NAME);
+  authState = mongoAuth;
+} catch (error) {
+  console.log(chalk.yellow('⚠️ MongoDB auth not available, using in-memory session storage'));
+  // Create a simple in-memory auth state
+  authState = {
+    state: {
+      creds: {},
+      keys: {}
+    },
+    saveCreds: () => Promise.resolve(),
+    closeConnection: () => Promise.resolve()
+  };
+}
 
-const { state, saveCreds, closeConnection } = await useMongoDBAuthState(MONGODB_URI, DB_NAME)
+const { state, saveCreds, closeConnection } = authState;
 
 const connectionOptions = {
   logger: Pino({
@@ -289,7 +312,7 @@ conn.isInit = false
 // Run this after conn is created
 await loadSessionOrPairing(conn);
 
-//SAVE CREDS.JSON AND RELOAD THEM AFTER RESTART
+// SAVE CREDS.JSON AND RELOAD THEM AFTER RESTART
 if (fs.existsSync(CREDS_FILE)) {
   try {
     const savedAuth = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf-8'))
@@ -301,27 +324,28 @@ if (fs.existsSync(CREDS_FILE)) {
         }
       }
       console.log(chalk.greenBright("✅ Session restored from creds.json"))
-      return true
     }
   } catch (err) {
     console.error("❌ Failed to load creds.json:", err)
   }
 }
 
-if (!opts['test']) {
-  if (global.db) {
+if (!global.opts['test']) {
+  if (global.db && typeof global.db.write === 'function') {
     setInterval(async () => {
       if (global.db.data) await global.db.write(global.db.data)
-if (opts['autocleartmp'] && (global.support || {}).find)
-        (tmp = [os.tmpdir(), 'tmp']),
-          tmp.forEach(filename =>
-            cp.spawn('find', [filename, '-amin', '3', '-type', 'f', '-delete'])
-          )
     }, 30 * 1000)
   }
 }
 
-if (opts['server']) (await import('./server.js')).default(global.conn, PORT)
+if (global.opts['server']) {
+  try {
+    const serverModule = await import('./server.js')
+    serverModule.default(global.conn, PORT)
+  } catch (error) {
+    console.log(chalk.yellow('⚠️ Server module not available'))
+  }
+}
 
 async function connectionUpdate(update) {
   const { connection, lastDisconnect, isNewLogin } = update
@@ -334,7 +358,7 @@ async function connectionUpdate(update) {
 
   if (code && code !== DisconnectReason.loggedOut && conn?.ws.socket == null) {
     try {
-      conn.logger.info(await global.reloadHandler(true))
+      await global.reloadHandler(true)
     } catch (error) {
       console.error('Error reloading handler:', error)
     }
@@ -344,7 +368,7 @@ async function connectionUpdate(update) {
     conn.logger.info(chalk.yellow('\n🌀 Restart Required... Preparing for restart'))
     
     try {
-      if (global.db.data) {
+      if (global.db.data && typeof global.db.write === 'function') {
         conn.logger.info(chalk.blue('Saving database before restart...'))
         await global.db.write(global.db.data)
         conn.logger.info(chalk.green('Database saved successfully'))
@@ -354,17 +378,10 @@ async function connectionUpdate(update) {
     }
     
     try {
-      await global.db.read()
-      conn.logger.info(chalk.green('MongoDB connection verified, proceeding with restart'))
+      await global.loadDatabase()
+      conn.logger.info(chalk.green('Database connection verified, proceeding with restart'))
     } catch (dbError) {
-      conn.logger.error(chalk.red('MongoDB connection error before restart, attempting to reconnect...'))
-      try {
-        global.db = new MongoDB(MONGODB_URI)
-        await global.db.read()
-        conn.logger.info(chalk.green('Successfully reconnected to MongoDB'))
-      } catch (reconnectError) {
-        conn.logger.error(chalk.red('Failed to reconnect to MongoDB:'), reconnectError)
-      }
+      conn.logger.error(chalk.red('Database connection error before restart, using in-memory storage'))
     }
     
     if (process.send) {
@@ -375,7 +392,7 @@ async function connectionUpdate(update) {
     }
   }
 
-  if (global.db.data == null) loadDatabase()
+  if (global.db.data == null) await global.loadDatabase()
 
   if (connection === 'open') {
     if (process.send) {
@@ -386,17 +403,10 @@ async function connectionUpdate(update) {
     }
     
     try {
-      await global.db.read()
-      conn.logger.info(chalk.green('MongoDB connection verified on open'))
+      await global.loadDatabase()
+      conn.logger.info(chalk.green('Database connection verified on open'))
     } catch (error) {
-      conn.logger.error(chalk.red('MongoDB connection error on open, attempting to reconnect...'))
-      try {
-        global.db = new MongoDB(MONGODB_URI)
-        await global.db.read()
-        conn.logger.info(chalk.green('Successfully reconnected to MongoDB on open'))
-      } catch (reconnectError) {
-        conn.logger.error(chalk.red('Failed to reconnect to MongoDB on open:'), reconnectError)
-      }
+      conn.logger.error(chalk.red('Database connection error on open, using in-memory storage'))
     }
     
     const { jid, name } = conn.user
@@ -428,77 +438,139 @@ async function connectionUpdate(update) {
     }
     
     try {
-      await global.db.read()
-      conn.logger.info(chalk.blue('MongoDB connection maintained despite WhatsApp disconnection'))
+      await global.loadDatabase()
+      conn.logger.info(chalk.blue('Database connection maintained despite WhatsApp disconnection'))
     } catch (error) {
-      conn.logger.error(chalk.red('MongoDB connection lost on WhatsApp disconnect, attempting to reconnect...'))
-      try {
-        global.db = new MongoDB(MONGODB_URI)
-        await global.db.read()
-        conn.logger.info(chalk.green('Successfully reconnected to MongoDB after disconnection'))
-      } catch (reconnectError) {
-        conn.logger.error(chalk.red('Failed to reconnect to MongoDB after disconnection:'), reconnectError)
-      }
+      conn.logger.error(chalk.red('Database connection lost on WhatsApp disconnect, using in-memory storage'))
     }
     
     conn.logger.error(chalk.yellow(`\nConnection closed... Get a new session`))
   }
 }
 
+// Event handlers with error catching
 conn.ev.on('messaging-history.set', ({ messages }) => {
   if (messages && messages.length > 0) {
-    mongoStore.saveMessages({ messages, type: 'append' }, DB_NAME)
+    mongoStore.saveMessages({ messages, type: 'append' }, DB_NAME).catch(console.error)
   }
 })
+
 conn.ev.on('contacts.update', async (contacts) => {
-  for (const contact of contacts) await mongoStore.saveContact(contact, DB_NAME)
-})
-conn.ev.on('contacts.upsert', async (contacts) => {
-  for (const contact of contacts) await mongoStore.saveContact(contact, DB_NAME)
-})
-conn.ev.on('messages.upsert', ({ messages }) => {
-  mongoStore.saveMessages({ messages, type: 'upsert' }, DB_NAME)
-})
-conn.ev.on('messages.update', async (messageUpdates) => {
-  mongoStore.saveMessages({ messages: messageUpdates, type: 'update' }, DB_NAME)
-})
-conn.ev.on('message-receipt.update', async (messageReceipts) => {
-  mongoStore.saveReceipts(messageReceipts, DB_NAME)
-})
-conn.ev.on('groups.update', async ([event]) => {
-  if (event.id) {
-    const metadata = await conn.groupMetadata(event.id)
-    if (metadata) {
-      groupMetadataCache.set(event.id, metadata)
-      await mongoStore.saveGroupMetadata(event.id, metadata, DB_NAME).catch(() => {})
-    }
-  }
-})
-conn.ev.on('group-participants.update', async (event) => {
-  if (event.id) {
-    const metadata = await conn.groupMetadata(event.id)
-    if (metadata) {
-      groupMetadataCache.set(event.id, metadata)
-      await mongoStore.saveGroupMetadata(event.id, metadata, DB_NAME).catch(() => {})
+  for (const contact of contacts) {
+    try {
+      await mongoStore.saveContact(contact, DB_NAME)
+    } catch (error) {
+      console.error('Error saving contact:', error)
     }
   }
 })
 
-process.on('exit', async () => { await closeConnection() })
-process.on('SIGINT', async () => { await closeConnection(); process.exit(0) })
-process.on('SIGTERM', async () => { await closeConnection(); process.exit(0) })
+conn.ev.on('contacts.upsert', async (contacts) => {
+  for (const contact of contacts) {
+    try {
+      await mongoStore.saveContact(contact, DB_NAME)
+    } catch (error) {
+      console.error('Error upserting contact:', error)
+    }
+  }
+})
+
+conn.ev.on('messages.upsert', ({ messages }) => {
+  mongoStore.saveMessages({ messages, type: 'upsert' }, DB_NAME).catch(console.error)
+})
+
+conn.ev.on('messages.update', async (messageUpdates) => {
+  mongoStore.saveMessages({ messages: messageUpdates, type: 'update' }, DB_NAME).catch(console.error)
+})
+
+conn.ev.on('message-receipt.update', async (messageReceipts) => {
+  mongoStore.saveReceipts(messageReceipts, DB_NAME).catch(console.error)
+})
+
+conn.ev.on('groups.update', async ([event]) => {
+  if (event.id) {
+    try {
+      const metadata = await conn.groupMetadata(event.id)
+      if (metadata) {
+        groupMetadataCache.set(event.id, metadata)
+        await mongoStore.saveGroupMetadata(event.id, metadata, DB_NAME).catch(() => {})
+      }
+    } catch (error) {
+      console.error('Error updating group metadata:', error)
+    }
+  }
+})
+
+conn.ev.on('group-participants.update', async (event) => {
+  if (event.id) {
+    try {
+      const metadata = await conn.groupMetadata(event.id)
+      if (metadata) {
+        groupMetadataCache.set(event.id, metadata)
+        await mongoStore.saveGroupMetadata(event.id, metadata, DB_NAME).catch(() => {})
+      }
+    } catch (error) {
+      console.error('Error updating group participants:', error)
+    }
+  }
+})
+
+process.on('exit', async () => { 
+  try {
+    await closeConnection() 
+  } catch (error) {
+    console.error('Error closing connection:', error)
+  }
+})
+
+process.on('SIGINT', async () => { 
+  try {
+    await closeConnection() 
+    process.exit(0)
+  } catch (error) {
+    process.exit(0)
+  }
+})
+
+process.on('SIGTERM', async () => { 
+  try {
+    await closeConnection() 
+    process.exit(0)
+  } catch (error) {
+    process.exit(0)
+  }
+})
 
 process.on('uncaughtException', console.error)
 
 let isInit = true
-let handler = await import('./handler.js')
+let handler = {}
+try {
+  const Handler = await import('./handler.js')
+  handler = Handler.default || Handler
+} catch (error) {
+  console.error('Error loading handler:', error)
+  // Create a minimal handler to prevent crashes
+  handler = {
+    handler: () => {},
+    pollUpdate: () => {},
+    participantsUpdate: () => {},
+    groupsUpdate: () => {},
+    deleteUpdate: () => {},
+    presenceUpdate: () => {}
+  }
+}
+
 global.reloadHandler = async function (restatConn) {
   try {
     const Handler = await import(`./handler.js?update=${Date.now()}`).catch(console.error)
-    if (Object.keys(Handler || {}).length) handler = Handler
+    if (Handler && Object.keys(Handler || {}).length) {
+      handler = Handler.default || Handler
+    }
   } catch (error) {
-    console.error
+    console.error('Error reloading handler:', error)
   }
+  
   if (restatConn) {
     const oldChats = global.conn.chats
     try {
@@ -510,6 +582,7 @@ global.reloadHandler = async function (restatConn) {
     })
     isInit = true
   }
+  
   if (!isInit) {
     conn.ev.off('messages.upsert', conn.handler)
     conn.ev.off('messages.update', conn.pollUpdate)
@@ -543,18 +616,6 @@ global.reloadHandler = async function (restatConn) {
   conn.connectionUpdate = connectionUpdate.bind(global.conn)
   conn.credsUpdate = saveCreds.bind(global.conn, true)
 
-  const currentDateTime = new Date()
-  const messageDateTime = new Date(conn.ev)
-  if (currentDateTime >= messageDateTime) {
-    const chats = Object.entries(conn.chats)
-      .filter(([jid, chat]) => !jid.endsWith('@g.us') && chat.isChats)
-      .map(v => v[0])
-  } else {
-    const chats = Object.entries(conn.chats)
-      .filter(([jid, chat]) => !jid.endsWith('@g.us') && chat.isChats)
-      .map(v => v[0])
-  }
-
   conn.ev.on('messages.upsert', conn.handler)
   conn.ev.on('messages.update', conn.pollUpdate)
   conn.ev.on('group-participants.update', conn.participantsUpdate)
@@ -563,6 +624,7 @@ global.reloadHandler = async function (restatConn) {
   conn.ev.on('presence.update', conn.presenceUpdate)
   conn.ev.on('connection.update', conn.connectionUpdate)
   conn.ev.on('creds.update', conn.credsUpdate)
+  
   isInit = false
   return true
 }
@@ -616,43 +678,52 @@ async function generateStatsData() {
 const pluginFolder = global.__dirname(join(__dirname, './plugins/index'))
 const pluginFilter = filename => /\.js$/.test(filename)
 global.plugins = {}
+
 async function filesInit() {
+  if (!fs.existsSync(pluginFolder)) {
+    console.log(chalk.yellow(`⚠️ Plugins folder not found: ${pluginFolder}`))
+    return
+  }
+  
   for (const filename of readdirSync(pluginFolder).filter(pluginFilter)) {
     try {
       const file = global.__filename(join(pluginFolder, filename))
       const module = await import(file)
       global.plugins[filename] = module.default || module
     } catch (e) {
-      conn.logger.error(e)
+      console.error(`Error loading plugin ${filename}:`, e)
       delete global.plugins[filename]
     }
   }
 }
+
 filesInit()
-  .then(_ => Object.keys(global.plugins))
+  .then(_ => console.log(chalk.green(`✅ Loaded ${Object.keys(global.plugins).length} plugins`)))
   .catch(console.error)
 
 global.reload = async (_ev, filename) => {
   if (pluginFilter(filename)) {
     const dir = global.__filename(join(pluginFolder, filename), true)
     if (filename in global.plugins) {
-      if (existsSync(dir)) conn.logger.info(`\nUpdated plugin - '${filename}'`)
+      if (existsSync(dir)) console.log(chalk.green(`\nUpdated plugin - '${filename}'`))
       else {
-        conn.logger.warn(`\nDeleted plugin - '${filename}'`)
+        console.log(chalk.yellow(`\nDeleted plugin - '${filename}'`))
         return delete global.plugins[filename]
       }
-    } else conn.logger.info(`\nNew plugin - '${filename}'`)
+    } else console.log(chalk.green(`\nNew plugin - '${filename}'`))
+    
     const err = syntaxerror(readFileSync(dir), filename, {
       sourceType: 'module',
       allowAwaitOutsideFunction: true,
     })
-    if (err) conn.logger.error(`\nSyntax error while loading '${filename}'\n${format(err)}`)
+    
+    if (err) console.error(chalk.red(`\nSyntax error while loading '${filename}'\n${format(err)}`))
     else {
       try {
         const module = await import(`${global.__filename(dir)}?update=${Date.now()}`)
         global.plugins[filename] = module.default || module
       } catch (e) {
-        conn.logger.error(`\nError require plugin '${filename}\n${format(e)}'`)
+        console.error(chalk.red(`\nError require plugin '${filename}\n${format(e)}'`))
       } finally {
         global.plugins = Object.fromEntries(
           Object.entries(global.plugins).sort(([a], [b]) => a.localeCompare(b))
@@ -661,9 +732,18 @@ global.reload = async (_ev, filename) => {
     }
   }
 }
+
 Object.freeze(global.reload)
-watch(pluginFolder, global.reload)
+
+// Only watch plugin folder if it exists
+if (fs.existsSync(pluginFolder)) {
+  watch(pluginFolder, global.reload)
+} else {
+  console.log(chalk.yellow(`⚠️ Cannot watch plugins folder: ${pluginFolder} does not exist`))
+}
+
 await global.reloadHandler()
+
 async function _quickTest() {
   const test = await Promise.all(
     [
@@ -713,7 +793,6 @@ async function _quickTest() {
 
 _quickTest().catch(console.error)
 
-
 async function generateDatabaseStats() {
   try {
     if (!global.db.data) await global.loadDatabase()
@@ -743,6 +822,7 @@ async function generateDatabaseStats() {
       
       stats.topPlugins = topPlugins
     }
+    
     return `
 ┌─────────────────────────────┐
 │   🤖 MEGA-AI DASHBOARD 🤖   │
@@ -763,7 +843,7 @@ async function generateDatabaseStats() {
 │ ⏱️ Uptime: ${padRight(stats.uptime, 18)} │
 │ 💾 Memory: ${padRight(stats.memoryUsage, 18)} │
 │                             │
-${stats.topPlugins ? `│ 🔝 Top Plugins:               │\n${stats.topPlugins.map(p => `│   • ${padRight(p.name.replace('.js', ''), 20)} ${p.total} │`).join('\n')}` : ''}
+${stats.topPlugins && stats.topPlugins.length > 0 ? `│ 🔝 Top Plugins:               │\n${stats.topPlugins.map(p => `│   • ${padRight(p.name.replace('.js', ''), 20)} ${p.total} │`).join('\n')}` : '│                             │'}
 └─────────────────────────────┘
     `.trim()
   } catch (error) {
@@ -771,7 +851,6 @@ ${stats.topPlugins ? `│ 🔝 Top Plugins:               │\n${stats.topPlugin
     return "Error generating dashboard statistics"
   }
 }
-    
 
 function formatUptime(seconds) {
   const days = Math.floor(seconds / (3600 * 24))
@@ -786,7 +865,8 @@ function formatUptime(seconds) {
   return result
 }
 
-
 function padRight(text, length) {
   return String(text).padEnd(length)
-        };
+}
+
+console.log(chalk.green('✅ Bot initialization completed successfully!'))
