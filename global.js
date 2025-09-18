@@ -158,9 +158,6 @@ async function loadSessionOrPairing(conn) {
       }
     }, 9000)
   }
-
-  return false
-}
 const groupMetadataCache = new NodeCache({ stdTTL: 5 * 60, useClones: false })
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017'
