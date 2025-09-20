@@ -12,7 +12,7 @@ import { useMongoDBAuthState } from './auth/mongo-auth.js'
 import * as mongoStore from './auth/mongo-store.js'
 import NodeCache from 'node-cache'
 import { MongoDB } from './lib/mongoDB.js'
-//import { File } from 'megajs'
+
 // First define the global utility functions
 global.__filename = function filename(pathURL = import.meta.url, rmPrefix = platform !== 'win32') {
   return rmPrefix
@@ -63,11 +63,162 @@ const {
 
 dotenv.config()
 
+// Session validation function
+function isValidSession(sessionData) {
+  if (!sessionData || typeof sessionData !== 'object') {
+    console.log(chalk.yellow('⚠️ Session data is not a valid object'));
+    return false;
+  }
+  
+  // Check for essential session properties
+  if (!sessionData.creds || typeof sessionData.creds !== 'object') {
+    console.log(chalk.yellow('⚠️ Session missing creds object'));
+    return false;
+  }
+  
+  if (sessionData.creds.registered !== true) {
+    console.log(chalk.yellow('⚠️ Session not registered'));
+    return false;
+  }
+  
+  if (!sessionData.creds.me || !sessionData.creds.me.id) {
+    console.log(chalk.yellow('⚠️ Session missing user identity'));
+    return false;
+  }
+  
+  // Check if session might be expired (based on timing if available)
+  if (sessionData.creds.accountSettings && sessionData.creds.accountSettings.accountSyncTimestamp) {
+    const syncTime = sessionData.creds.accountSettings.accountSyncTimestamp;
+    const daysSinceSync = (Date.now() - syncTime) / (1000 * 60 * 60 * 24);
+    if (daysSinceSync > 30) {
+      console.log(chalk.yellow(`⚠️ Session might be expired (last sync: ${Math.floor(daysSinceSync)} days ago)`));
+      return false;
+    }
+  }
+  
+  console.log(chalk.green('✅ Session validation passed'));
+  return true;
+}
+
+// Improved pairing request function
+async function requestNewPairing(conn) {
+  let phoneNumber = process.env.BOT_NUMBER?.replace(/[^0-9]/g, "")
+  if (!phoneNumber || phoneNumber.length < 8) {
+    console.log(chalk.red("❌ Invalid phone number format. Example: 92xxx"))
+    process.exit(0)
+  }
+
+  conn.logger.info("\nWaiting For Login\n")
+
+  try {
+    let code = await conn.requestPairingCode(phoneNumber)
+    code = code?.match(/.{1,4}/g)?.join("-") || code
+
+    global.pairingCode = code
+
+    console.log(
+      chalk.bold.greenBright("Your Pairing Code:") +
+        " " +
+        chalk.bgGreenBright(chalk.black(code))
+    )
+
+    if (process.send) {
+      process.send({
+        type: "pairing-code",
+        code: code,
+        error: false,
+      })
+    }
+
+    // Wait for connection with timeout
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("Pairing timeout after 2 minutes"));
+      }, 120000);
+      
+      // Check when connection is established
+      const checkConnection = () => {
+        if (conn.user && conn.user.id) {
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+      
+      // Check every 5 seconds
+      const interval = setInterval(checkConnection, 5000);
+      
+      // Also resolve if connection is already established
+      checkConnection();
+      
+      // Cleanup on resolve
+      promise.finally(() => {
+        clearTimeout(timeout);
+        clearInterval(interval);
+      });
+    });
+    
+    console.log(chalk.green("✅ Pairing successful, connection established"));
+    return true;
+  } catch (error) {
+    console.log(chalk.bgBlack(chalk.redBright("Failed to generate pairing code:")), error)
+    if (process.send) {
+      process.send({
+        type: "pairing-code",
+        code: "ERROR: Failed to generate pairing code",
+        error: true,
+      })
+    }
+    return false;
+  }
+}
+
+// Session backup system
+function backupSession(sessionData) {
+  try {
+    const backupDir = join(SESSIONS_DIR, 'backups');
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+    
+    const backupFile = join(backupDir, `creds-backup-${Date.now()}.json`);
+    fs.writeFileSync(backupFile, JSON.stringify(sessionData, null, 2));
+    console.log(chalk.blue(`📦 Session backed up to: ${backupFile}`));
+  } catch (error) {
+    console.error('Backup failed:', error);
+  }
+}
+
 async function loadSessionOrPairing(conn) {
-  // ✅ Case 1: creds.json already exists
+  // ✅ Case 1: creds.json already exists - Validate it first
   if (fs.existsSync(CREDS_FILE)) {
-    console.log(chalk.greenBright("✅ Session loaded from local creds.json"))
-    return true
+    try {
+      const sessionData = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf-8'));
+      
+      // Validate session data structure
+      if (!isValidSession(sessionData)) {
+        console.log(chalk.yellow("⚠️ Session file exists but is invalid, regenerating..."));
+        // Create backup before deleting
+        backupSession(sessionData);
+        fs.unlinkSync(CREDS_FILE); // Remove invalid session
+        return await requestNewPairing(conn);
+      }
+      
+      console.log(chalk.greenBright("✅ Valid session loaded from local creds.json"))
+      
+      // Update session timestamp to prevent expiration
+      if (sessionData.creds) {
+        sessionData.creds.accountSettings = {
+          ...(sessionData.creds.accountSettings || {}),
+          accountSyncTimestamp: Date.now()
+        };
+        fs.writeFileSync(CREDS_FILE, JSON.stringify(sessionData, null, 2));
+      }
+      
+      return true;
+    } catch (err) {
+      console.error("❌ Error reading/parsing creds.json:", err);
+      return await requestNewPairing(conn);
+    }
   }
 
   // ✅ Case 2: SESSION_ID provided
@@ -77,75 +228,44 @@ async function loadSessionOrPairing(conn) {
       try {
         const sessdata = process.env.SESSION_ID.replace("EDITH-MD~", "")
         const decodedData = Buffer.from(sessdata, "base64").toString("utf-8")
-        fs.writeFileSync(CREDS_FILE, decodedData)
-        console.log(chalk.greenBright("✅ Session loaded from EDITH-MD~ string"))
-        return true
+        const sessionData = JSON.parse(decodedData);
+        
+        // Validate the session data before saving
+        if (isValidSession(sessionData)) {
+          // Update timestamp before saving
+          sessionData.creds.accountSettings = {
+            ...(sessionData.creds.accountSettings || {}),
+            accountSyncTimestamp: Date.now()
+          };
+          
+          const updatedData = JSON.stringify(sessionData, null, 2);
+          fs.writeFileSync(CREDS_FILE, updatedData);
+          console.log(chalk.greenBright("✅ Valid session loaded from EDITH-MD~ string"))
+          return true;
+        } else {
+          console.log(chalk.yellow("⚠️ Session data from EDITH-MD~ is invalid, falling back to pairing"))
+        }
       } catch (err) {
-        console.error("❌ Error decoding session data:", err)
+        console.error("❌ Error decoding session data:", err);
       }
     }
 
     // Case 2b: BANDAHAELI~ (Download from MEGA) - Disabled for now due to megajs issues
     else if (process.env.SESSION_ID.startsWith("BANDAHAELI~")) {
-      console.log(chalk.yellow("⚠️ MEGA session download is temporarily disabled"))
+      console.log(chalk.yellow("⚠️ MEGA session download is temporarily disabled"));
       // Implementation commented out due to megajs dependency issues
     }
 
     // Invalid SESSION_ID prefix
     else {
-      console.log("❌ Invalid SESSION_ID format, falling back to pairing code...")
+      console.log(chalk.yellow("❌ Invalid SESSION_ID format, falling back to pairing code..."));
     }
   } else {
-    console.log(chalk.yellow("⚠️ No SESSION_ID provided, falling back to pairing code..."))
+    console.log(chalk.yellow("⚠️ No SESSION_ID provided, falling back to pairing code..."));
   }
 
-  // ❌ Case 3: No session → request pairing code
-  if (!conn.authState.creds.registered) {
-    let phoneNumber = process.env.BOT_NUMBER?.replace(/[^0-9]/g, "")
-    if (!phoneNumber || phoneNumber.length < 8) {
-      console.log(chalk.red("❌ Invalid phone number format. Example: 92xxx"))
-      process.exit(0)
-    }
-
-    conn.logger.info("\nWaiting For Login\n")
-
-    setTimeout(async () => {
-      try {
-        let code = await conn.requestPairingCode(phoneNumber)
-        code = code?.match(/.{1,4}/g)?.join("-") || code
-
-        global.pairingCode = code
-
-        console.log(
-          chalk.bold.greenBright("Your Pairing Code:") +
-            " " +
-            chalk.bgGreenBright(chalk.black(code))
-        )
-
-        if (process.send) {
-          process.send({
-            type: "pairing-code",
-            code: code,
-            error: false,
-          })
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 60000))
-        conn.logger.info("1 minute passed, continuing with connection...")
-      } catch (error) {
-        console.log(chalk.bgBlack(chalk.redBright("Failed to generate pairing code:")), error)
-        if (process.send) {
-          process.send({
-            type: "pairing-code",
-            code: "ERROR: Failed to generate pairing code",
-            error: true,
-          })
-        }
-      }
-    }, 9000)
-  }
-
-  return false
+  // ❌ Case 3: No valid session → request pairing code
+  return await requestNewPairing(conn);
 }
 
 const groupMetadataCache = new NodeCache({ stdTTL: 5 * 60, useClones: false })
@@ -158,17 +278,32 @@ const globalDB = new MongoDB(MONGODB_URI)
 global.db = globalDB
 
 global.loadDatabase = async function loadDatabase() {
-  if (global.db && typeof global.db.read === 'function') {
-    await global.db.read()
-    global.db.data = {
-      users: {},
-      chats: {},
-      settings: {},
-      stats: {},
-      ...(global.db.data || {})
+  try {
+    if (global.db && typeof global.db.read === 'function') {
+      await global.db.read()
+      global.db.data = {
+        users: {},
+        chats: {},
+        settings: {},
+        stats: {},
+        ...(global.db.data || {})
+      }
+      console.log(chalk.green('✅ Database loaded successfully'));
+    } else {
+      console.log(chalk.yellow('⚠️ Database not available, using in-memory storage'))
+      global.db = {
+        data: {
+          users: {},
+          chats: {},
+          settings: {},
+          stats: {}
+        },
+        read: () => Promise.resolve(),
+        write: () => Promise.resolve()
+      }
     }
-  } else {
-    console.log(chalk.yellow('⚠️ Database not available, using in-memory storage'))
+  } catch (error) {
+    console.error(chalk.red('❌ Error loading database:'), error);
     global.db = {
       data: {
         users: {},
@@ -185,7 +320,11 @@ global.loadDatabase = async function loadDatabase() {
 // Set up interval for saving data only if db is available
 if (global.db && typeof global.db.write === 'function') {
   setInterval(async () => {
-    if (global.db.data) await global.db.write(global.db.data)
+    try {
+      if (global.db.data) await global.db.write(global.db.data)
+    } catch (error) {
+      console.error(chalk.red('❌ Error saving database:'), error);
+    }
   }, 60 * 1000)
 }
 
@@ -229,6 +368,7 @@ let authState = { creds: {}, keys: {} };
 try {
   const mongoAuth = await useMongoDBAuthState(MONGODB_URI, DB_NAME);
   authState = mongoAuth;
+  console.log(chalk.green('✅ MongoDB auth initialized successfully'));
 } catch (error) {
   console.log(chalk.yellow('⚠️ MongoDB auth not available, using in-memory session storage'));
   // Create a simple in-memory auth state
@@ -309,6 +449,36 @@ const connectionOptions = {
 global.conn = makeWASocket(connectionOptions)
 conn.isInit = false
 
+// Session refresh logic
+async function refreshSession() {
+  try {
+    if (conn.authState.creds && conn.authState.creds.registered) {
+      // Update session timestamp to prevent expiration
+      conn.authState.creds.accountSettings = {
+        ...(conn.authState.creds.accountSettings || {}),
+        accountSyncTimestamp: Date.now()
+      };
+      
+      // Save the updated session
+      await saveCreds();
+      
+      // Also update the local file
+      if (fs.existsSync(CREDS_FILE)) {
+        const sessionData = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf-8'));
+        sessionData.creds.accountSettings = {
+          ...(sessionData.creds.accountSettings || {}),
+          accountSyncTimestamp: Date.now()
+        };
+        fs.writeFileSync(CREDS_FILE, JSON.stringify(sessionData, null, 2));
+      }
+      
+      console.log(chalk.blue('🔄 Session refreshed'));
+    }
+  } catch (error) {
+    console.error('Session refresh failed:', error);
+  }
+}
+
 // Run this after conn is created
 await loadSessionOrPairing(conn);
 
@@ -324,6 +494,9 @@ if (fs.existsSync(CREDS_FILE)) {
         }
       }
       console.log(chalk.greenBright("✅ Session restored from creds.json"))
+      
+      // Schedule periodic session refresh (every 7 days)
+      setInterval(refreshSession, 7 * 24 * 60 * 60 * 1000);
     }
   } catch (err) {
     console.error("❌ Failed to load creds.json:", err)
@@ -333,7 +506,11 @@ if (fs.existsSync(CREDS_FILE)) {
 if (!global.opts['test']) {
   if (global.db && typeof global.db.write === 'function') {
     setInterval(async () => {
-      if (global.db.data) await global.db.write(global.db.data)
+      try {
+        if (global.db.data) await global.db.write(global.db.data)
+      } catch (error) {
+        console.error(chalk.red('❌ Error saving database:'), error);
+      }
     }, 30 * 1000)
   }
 }
@@ -427,6 +604,9 @@ async function connectionUpdate(update) {
     }
 
     conn.logger.info(chalk.yellow('\n👍 R E A D Y'))
+    
+    // Schedule session refresh after successful connection
+    setTimeout(refreshSession, 10000);
   }
 
   if (connection === 'close') {
@@ -541,7 +721,25 @@ process.on('SIGTERM', async () => {
   }
 })
 
-process.on('uncaughtException', console.error)
+// Enhanced error handling
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Attempt to reinitialize connection on critical errors
+  if (reason.message && reason.message.includes('session')) {
+    console.log(chalk.yellow('🔄 Session error detected, attempting reconnect...'));
+    setTimeout(() => {
+      global.reloadHandler(true).catch(console.error);
+    }, 5000);
+  }
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Don't exit for session-related errors
+  if (!error.message.includes('session') && !error.message.includes('auth')) {
+    process.exit(1);
+  }
+});
 
 let isInit = true
 let handler = {}
