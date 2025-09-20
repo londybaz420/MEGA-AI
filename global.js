@@ -63,44 +63,30 @@ const {
 
 dotenv.config()
 
-// Session validation function
+// ✅ Session validation function - Less restrictive
 function isValidSession(sessionData) {
   if (!sessionData || typeof sessionData !== 'object') {
     console.log(chalk.yellow('⚠️ Session data is not a valid object'));
     return false;
   }
   
-  // Check for essential session properties
+  // Basic validation - check if it has the basic structure of a Baileys session
   if (!sessionData.creds || typeof sessionData.creds !== 'object') {
     console.log(chalk.yellow('⚠️ Session missing creds object'));
     return false;
   }
   
-  if (sessionData.creds.registered !== true) {
-    console.log(chalk.yellow('⚠️ Session not registered'));
-    return false;
-  }
-  
+  // Check if we have minimal required data
   if (!sessionData.creds.me || !sessionData.creds.me.id) {
     console.log(chalk.yellow('⚠️ Session missing user identity'));
     return false;
-  }
-  
-  // Check if session might be expired (based on timing if available)
-  if (sessionData.creds.accountSettings && sessionData.creds.accountSettings.accountSyncTimestamp) {
-    const syncTime = sessionData.creds.accountSettings.accountSyncTimestamp;
-    const daysSinceSync = (Date.now() - syncTime) / (1000 * 60 * 60 * 24);
-    if (daysSinceSync > 30) {
-      console.log(chalk.yellow(`⚠️ Session might be expired (last sync: ${Math.floor(daysSinceSync)} days ago)`));
-      return false;
-    }
   }
   
   console.log(chalk.green('✅ Session validation passed'));
   return true;
 }
 
-// Improved pairing request function
+// ✅ Improved pairing request function
 async function requestNewPairing(conn) {
   let phoneNumber = process.env.BOT_NUMBER?.replace(/[^0-9]/g, "")
   if (!phoneNumber || phoneNumber.length < 8) {
@@ -149,12 +135,6 @@ async function requestNewPairing(conn) {
       
       // Also resolve if connection is already established
       checkConnection();
-      
-      // Cleanup on resolve
-      promise.finally(() => {
-        clearTimeout(timeout);
-        clearInterval(interval);
-      });
     });
     
     console.log(chalk.green("✅ Pairing successful, connection established"));
@@ -188,36 +168,32 @@ function backupSession(sessionData) {
   }
 }
 
+// ✅ Improved session loading function
 async function loadSessionOrPairing(conn) {
-  // ✅ Case 1: creds.json already exists - Validate it first
+  // ✅ Case 1: creds.json already exists
   if (fs.existsSync(CREDS_FILE)) {
     try {
       const sessionData = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf-8'));
       
       // Validate session data structure
-      if (!isValidSession(sessionData)) {
-        console.log(chalk.yellow("⚠️ Session file exists but is invalid, regenerating..."));
-        // Create backup before deleting
-        backupSession(sessionData);
-        fs.unlinkSync(CREDS_FILE); // Remove invalid session
-        return await requestNewPairing(conn);
+      if (isValidSession(sessionData)) {
+        console.log(chalk.greenBright("✅ Valid session loaded from local creds.json"))
+        
+        // Update session timestamp to prevent expiration
+        if (sessionData.creds) {
+          sessionData.creds.accountSettings = {
+            ...(sessionData.creds.accountSettings || {}),
+            accountSyncTimestamp: Date.now()
+          };
+          fs.writeFileSync(CREDS_FILE, JSON.stringify(sessionData, null, 2));
+        }
+        
+        return true;
+      } else {
+        console.log(chalk.yellow("⚠️ Session file exists but is invalid, will try other methods..."));
       }
-      
-      console.log(chalk.greenBright("✅ Valid session loaded from local creds.json"))
-      
-      // Update session timestamp to prevent expiration
-      if (sessionData.creds) {
-        sessionData.creds.accountSettings = {
-          ...(sessionData.creds.accountSettings || {}),
-          accountSyncTimestamp: Date.now()
-        };
-        fs.writeFileSync(CREDS_FILE, JSON.stringify(sessionData, null, 2));
-      }
-      
-      return true;
     } catch (err) {
       console.error("❌ Error reading/parsing creds.json:", err);
-      return await requestNewPairing(conn);
     }
   }
 
@@ -243,28 +219,45 @@ async function loadSessionOrPairing(conn) {
           console.log(chalk.greenBright("✅ Valid session loaded from EDITH-MD~ string"))
           return true;
         } else {
-          console.log(chalk.yellow("⚠️ Session data from EDITH-MD~ is invalid, falling back to pairing"))
+          console.log(chalk.yellow("⚠️ Session data from EDITH-MD~ is invalid"));
         }
       } catch (err) {
         console.error("❌ Error decoding session data:", err);
       }
     }
 
-    // Case 2b: BANDAHAELI~ (Download from MEGA) - Disabled for now due to megajs issues
-    else if (process.env.SESSION_ID.startsWith("BANDAHAELI~")) {
-      console.log(chalk.yellow("⚠️ MEGA session download is temporarily disabled"));
-      // Implementation commented out due to megajs dependency issues
+    // Case 2b: Direct JSON (if someone pastes full JSON)
+    else if (process.env.SESSION_ID.startsWith("{")) {
+      try {
+        const sessionData = JSON.parse(process.env.SESSION_ID);
+        
+        if (isValidSession(sessionData)) {
+          // Update timestamp before saving
+          sessionData.creds.accountSettings = {
+            ...(sessionData.creds.accountSettings || {}),
+            accountSyncTimestamp: Date.now()
+          };
+          
+          const updatedData = JSON.stringify(sessionData, null, 2);
+          fs.writeFileSync(CREDS_FILE, updatedData);
+          console.log(chalk.greenBright("✅ Valid session loaded from direct JSON"))
+          return true;
+        }
+      } catch (err) {
+        console.error("❌ Error parsing direct JSON session:", err);
+      }
     }
 
-    // Invalid SESSION_ID prefix
+    // Invalid SESSION_ID format
     else {
-      console.log(chalk.yellow("❌ Invalid SESSION_ID format, falling back to pairing code..."));
+      console.log(chalk.yellow("❌ Invalid SESSION_ID format"));
     }
   } else {
-    console.log(chalk.yellow("⚠️ No SESSION_ID provided, falling back to pairing code..."));
+    console.log(chalk.yellow("⚠️ No SESSION_ID provided"));
   }
 
   // ❌ Case 3: No valid session → request pairing code
+  console.log(chalk.yellow("🔄 Falling back to pairing code..."));
   return await requestNewPairing(conn);
 }
 
@@ -479,51 +472,7 @@ async function refreshSession() {
   }
 }
 
-// Run this after conn is created
-await loadSessionOrPairing(conn);
-
-// SAVE CREDS.JSON AND RELOAD THEM AFTER RESTART
-if (fs.existsSync(CREDS_FILE)) {
-  try {
-    const savedAuth = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf-8'))
-    if (savedAuth?.creds) {
-      conn.authState.creds = savedAuth.creds
-      if (savedAuth.keys) {
-        for (const [key, value] of Object.entries(savedAuth.keys)) {
-          await conn.authState.keys.set(key, value)
-        }
-      }
-      console.log(chalk.greenBright("✅ Session restored from creds.json"))
-      
-      // Schedule periodic session refresh (every 7 days)
-      setInterval(refreshSession, 7 * 24 * 60 * 60 * 1000);
-    }
-  } catch (err) {
-    console.error("❌ Failed to load creds.json:", err)
-  }
-}
-
-if (!global.opts['test']) {
-  if (global.db && typeof global.db.write === 'function') {
-    setInterval(async () => {
-      try {
-        if (global.db.data) await global.db.write(global.db.data)
-      } catch (error) {
-        console.error(chalk.red('❌ Error saving database:'), error);
-      }
-    }, 30 * 1000)
-  }
-}
-
-if (global.opts['server']) {
-  try {
-    const serverModule = await import('./server.js')
-    serverModule.default(global.conn, PORT)
-  } catch (error) {
-    console.log(chalk.yellow('⚠️ Server module not available'))
-  }
-}
-
+// ✅ Modified connection update to handle session properly
 async function connectionUpdate(update) {
   const { connection, lastDisconnect, isNewLogin } = update
   global.stopped = connection
@@ -533,11 +482,27 @@ async function connectionUpdate(update) {
   const code =
     lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.output?.payload?.statusCode
 
+  // Handle session termination errors
+  if (code === DisconnectReason.loggedOut || code === 515) {
+    console.log(chalk.red("❌ Session terminated, need to generate new session"));
+    
+    // Delete old session file
+    if (fs.existsSync(CREDS_FILE)) {
+      fs.unlinkSync(CREDS_FILE);
+      console.log(chalk.yellow("🗑️ Removed old session file"));
+    }
+    
+    // Request new pairing
+    await requestNewPairing(conn);
+    return;
+  }
+
   if (code && code !== DisconnectReason.loggedOut && conn?.ws.socket == null) {
+    console.log(chalk.yellow(`🔄 Reconnecting after disconnect, code: ${code}`));
     try {
-      await global.reloadHandler(true)
+      await global.reloadHandler(true).catch(console.error);
     } catch (error) {
-      console.error('Error reloading handler:', error)
+      console.error('Error reloading handler:', error);
     }
   }
 
@@ -625,6 +590,49 @@ async function connectionUpdate(update) {
     }
     
     conn.logger.error(chalk.yellow(`\nConnection closed... Get a new session`))
+  }
+}
+
+// Run this after conn is created
+await loadSessionOrPairing(conn);
+
+// SAVE CREDS.JSON AND RELOAD THEM AFTER RESTART
+if (fs.existsSync(CREDS_FILE)) {
+  try {
+    const savedAuth = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf-8'))
+    if (savedAuth?.creds) {
+      // Only update if we don't already have a valid session
+      if (!conn.authState.creds || !conn.authState.creds.registered) {
+        conn.authState.creds = savedAuth.creds
+        console.log(chalk.greenBright("✅ Session restored from creds.json"))
+        
+        // Schedule periodic session refresh (every 7 days)
+        setInterval(refreshSession, 7 * 24 * 60 * 60 * 1000);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Failed to load creds.json:", err)
+  }
+}
+
+if (!global.opts['test']) {
+  if (global.db && typeof global.db.write === 'function') {
+    setInterval(async () => {
+      try {
+        if (global.db.data) await global.db.write(global.db.data)
+      } catch (error) {
+        console.error(chalk.red('❌ Error saving database:'), error);
+      }
+    }, 30 * 1000)
+  }
+}
+
+if (global.opts['server']) {
+  try {
+    const serverModule = await import('./server.js')
+    serverModule.default(global.conn, PORT)
+  } catch (error) {
+    console.log(chalk.yellow('⚠️ Server module not available'))
   }
 }
 
