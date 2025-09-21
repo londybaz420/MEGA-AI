@@ -59,25 +59,35 @@ import cp from 'child_process';
 
 dotenv.config();
 
-// Session initialization
+// Enhanced session initialization with retry mechanism
 async function main() {
   const txt = global.SESSION_ID || process.env.SESSION_ID;
 
   if (!txt) {
-    console.error('Environment variable SESSION_ID not found.');
-    return;
+    console.error('❌ Environment variable SESSION_ID not found.');
+    process.exit(1);
   }
 
-  try {
-    await SaveCreds(txt);
-    console.log('Session check completed.');
-  } catch (error) {
-    console.error('Error initializing session:', error);
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      await SaveCreds(txt);
+      console.log('✅ Session check completed successfully.');
+      return;
+    } catch (error) {
+      retries--;
+      console.error(`❌ Error initializing session (${retries} retries left):`, error.message);
+      if (retries === 0) {
+        console.error('❌ Failed to initialize session after multiple attempts');
+        process.exit(1);
+      }
+      await delay(2000);
+    }
   }
 }
 
 await main();
-await delay(1000 * 5); // Reduced delay to 5 seconds
+await delay(2000);
 
 // Configuration
 const pairingCode = !!global.pairingNumber || process.argv.includes('--pairing-code');
@@ -86,25 +96,32 @@ const useStore = true;
 
 const MAIN_LOGGER = pino({ timestamp: () => `,"time":"${new Date().toJSON()}"` });
 const logger = MAIN_LOGGER.child({});
-logger.level = 'silent'; // Changed from 'fatal' to 'silent' for less verbose logging
+logger.level = 'silent';
 
-const store = useStore ? makeInMemoryStore({ logger }) : undefined;
-
-// Store management with error handling
-if (store) {
-  try {
-    store.readFromFile('./session.json');
-  } catch (error) {
-    console.log('No existing session store found, creating new one.');
-  }
-
-  setInterval(() => {
+// Store management with enhanced error handling
+let store;
+try {
+  store = useStore ? makeInMemoryStore({ logger }) : undefined;
+  
+  if (store) {
     try {
-      store.writeToFile('./session.json');
+      store.readFromFile('./session.json');
+      console.log('✅ Session store loaded successfully');
     } catch (error) {
-      console.error('Error writing store to file:', error);
+      console.log('ℹ️ No existing session store found, creating new one');
     }
-  }, 30000); // Increased interval to 30 seconds
+
+    setInterval(() => {
+      try {
+        store.writeToFile('./session.json');
+      } catch (error) {
+        console.error('❌ Error writing store to file:', error.message);
+      }
+    }, 30000);
+  }
+} catch (error) {
+  console.error('❌ Error creating store:', error.message);
+  store = undefined;
 }
 
 const msgRetryCounterCache = new NodeCache();
@@ -155,7 +172,7 @@ global.prefix = new RegExp(
 );
 global.opts['db'] = process.env.DATABASE_URL;
 
-// Database initialization with better error handling
+// Enhanced database initialization
 try {
   global.db = new Low(
     /https?:\/\//.test(opts['db'] || '') ?
@@ -163,10 +180,11 @@ try {
         (opts['mongodbv2'] ? new mongoDBV2(opts['db']) : new mongoDB(opts['db'])) :
         new JSONFile(`${opts._[0] ? opts._[0] + '_' : ''}database.json`)
   );
+  console.log('✅ Database initialized successfully');
 } catch (error) {
-  console.error('Database initialization error:', error);
-  // Fallback to JSON file
+  console.error('❌ Database initialization error:', error.message);
   global.db = new Low(new JSONFile('database.json'));
+  console.log('✅ Fallback to JSON database');
 }
 
 global.DATABASE = global.db;
@@ -179,7 +197,7 @@ global.loadDatabase = async function loadDatabase() {
           clearInterval(interval);
           resolve(global.db.data == null ? global.loadDatabase() : global.db.data);
         }
-      }, 1 * 1000);
+      }, 1000);
     });
   }
   
@@ -189,7 +207,7 @@ global.loadDatabase = async function loadDatabase() {
   try {
     await global.db.read();
   } catch (error) {
-    console.error('Error reading database:', error);
+    console.error('❌ Error reading database:', error.message);
     global.db.data = {};
   }
   global.db.READ = null;
@@ -215,14 +233,15 @@ try {
   const authState = await useMultiFileAuthState(global.authFolder);
   state = authState.state;
   saveCreds = authState.saveCreds;
+  console.log('✅ Auth state initialized successfully');
 } catch (error) {
-  console.error('Error initializing auth state:', error);
+  console.error('❌ Error initializing auth state:', error.message);
   process.exit(1);
 }
 
-// Connection options with better error handling
+// Enhanced connection options with better timeout handling
 const connectionOptions = {
-  version: [2, 3000, 1015901307],
+  version: (await fetchLatestWaWebVersion()).version,
   logger: Pino({ level: 'silent' }),
   printQRInTerminal: !pairingCode,
   browser: Browsers.macOS("Safari"),
@@ -235,7 +254,7 @@ const connectionOptions = {
   getMessage: async key => {
     try {
       let jid = jidNormalizedUser(key.remoteJid);
-      let msg = await store.loadMessage(jid, key.id);
+      let msg = store ? await store.loadMessage(jid, key.id) : null;
       return msg?.message || '';
     } catch (error) {
       return '';
@@ -263,25 +282,45 @@ const connectionOptions = {
     return message;
   },
   msgRetryCounterCache,
-  defaultQueryTimeoutMs: undefined,
+  defaultQueryTimeoutMs: 20000,
+  connectTimeoutMs: 30000,
+  keepAliveIntervalMs: 15000,
   syncFullHistory: false,
-  connectTimeoutMs: 60000, // Added connection timeout
-  keepAliveIntervalMs: 10000, // Added keep alive
+  transactionOpts: { maxRetries: 3, delayBetweenTries: 1000 },
+  retryRequestDelayMs: 1000,
+  maxMsgRetryCount: 3,
 };
 
-global.conn = makeWASocket(connectionOptions);
-conn.isInit = false;
+let globalConn;
+let connectionAttempts = 0;
+const MAX_CONNECTION_ATTEMPTS = 5;
 
-if (store) {
+async function createConnection() {
   try {
-    store.bind(conn.ev);
+    connectionAttempts++;
+    console.log(`🔗 Connection attempt ${connectionAttempts}/${MAX_CONNECTION_ATTEMPTS}`);
+    
+    global.conn = makeWASocket(connectionOptions);
+    global.conn.isInit = false;
+    globalConn = global.conn;
+
+    if (store) {
+      try {
+        store.bind(global.conn.ev);
+      } catch (error) {
+        console.error('❌ Error binding store to connection:', error.message);
+      }
+    }
+
+    return global.conn;
   } catch (error) {
-    console.error('Error binding store to connection:', error);
+    console.error('❌ Error creating connection:', error.message);
+    throw error;
   }
 }
 
 // Pairing code logic
-if (pairingCode && !conn.authState.creds.registered) {
+if (pairingCode && (!state.creds.registered || connectionAttempts === 0)) {
   let phoneNumber;
   
   if (!!global.pairingNumber) {
@@ -295,41 +334,28 @@ if (pairingCode && !conn.authState.creds.registered) {
 
   setTimeout(async () => {
     try {
-      let code = await conn.requestPairingCode(phoneNumber);
+      let code = await global.conn.requestPairingCode(phoneNumber);
       code = code?.match(/.{1,4}/g)?.join('-') || code;
       const pairingCodeMsg =
         chalk.bold.greenBright('Your Pairing Code:') + ' ' + chalk.bgGreenBright(chalk.black(code));
       console.log(pairingCodeMsg);
     } catch (error) {
-      console.error('Error requesting pairing code:', error);
+      console.error('❌ Error requesting pairing code:', error.message);
     }
   }, 3000);
 }
 
-conn.logger.info('\nWaiting For Login\n');
+console.log('\n⏳ Waiting For Login\n');
 
 // Database autosave and cleanup
 if (!opts['test']) {
-  if (global.db) {
-    setInterval(async () => {
-      try {
-        if (global.db.data) await global.db.write();
-        
-        if (opts['autocleartmp'] && (global.support || {}).find) {
-          const tmp = [os.tmpdir(), 'tmp'];
-          tmp.forEach(filename => {
-            try {
-              cp.spawn('find', [filename, '-amin', '3', '-type', 'f', '-delete']);
-            } catch (error) {
-              console.error('Error cleaning tmp files:', error);
-            }
-          });
-        }
-      } catch (error) {
-        console.error('Error in maintenance tasks:', error);
-      }
-    }, 60 * 1000); // Increased to 1 minute
-  }
+  setInterval(async () => {
+    try {
+      if (global.db.data) await global.db.write();
+    } catch (error) {
+      console.error('❌ Error writing database:', error.message);
+    }
+  }, 60000);
 }
 
 // Server initialization
@@ -337,21 +363,21 @@ if (opts['server']) {
   try {
     (await import('./server.js')).default(global.conn, PORT);
   } catch (error) {
-    console.error('Error starting server:', error);
+    console.error('❌ Error starting server:', error.message);
   }
 }
 
-// Cleanup function with better error handling
+// Enhanced cleanup function
 function runCleanup() {
   clearTmp()
     .then(() => {
-      console.log('Temporary file cleanup completed.');
+      console.log('✅ Temporary file cleanup completed');
     })
     .catch(error => {
-      console.error('An error occurred during temporary file cleanup:', error);
+      console.error('❌ Temporary file cleanup error:', error.message);
     })
     .finally(() => {
-      setTimeout(runCleanup, 1000 * 60 * 5); // Reduced to 5 minutes
+      setTimeout(runCleanup, 300000);
     });
 }
 
@@ -359,50 +385,73 @@ runCleanup();
 
 function clearsession() {
   try {
-    const directorio = readdirSync('./session');
-    const filesFolderPreKeys = directorio.filter(file => file.startsWith('pre-key-'));
-    
-    filesFolderPreKeys.forEach(files => {
-      try {
-        unlinkSync(`./session/${files}`);
-      } catch (error) {
-        console.error(`Error deleting file ${files}:`, error);
-      }
-    });
+    if (existsSync('./session')) {
+      const directorio = readdirSync('./session');
+      const filesFolderPreKeys = directorio.filter(file => file.startsWith('pre-key-'));
+      
+      filesFolderPreKeys.forEach(file => {
+        try {
+          unlinkSync(`./session/${file}`);
+        } catch (error) {
+          console.error(`❌ Error deleting file ${file}:`, error.message);
+        }
+      });
+    }
   } catch (error) {
-    console.error('Error clearing session:', error);
+    console.error('❌ Error clearing session:', error.message);
   }
 }
 
-// Connection update handler with better error recovery
+// Enhanced connection update handler
 async function connectionUpdate(update) {
   const { connection, lastDisconnect, isNewLogin, qr } = update;
   global.stopped = connection;
 
-  if (isNewLogin) conn.isInit = true;
+  if (isNewLogin) {
+    global.conn.isInit = true;
+    console.log('🔄 New login detected');
+  }
 
   const code = lastDisconnect?.error?.output?.statusCode || 
               lastDisconnect?.error?.output?.payload?.statusCode;
 
-  if (code && code !== DisconnectReason.loggedOut && conn?.ws.socket == null) {
-    console.log(`Connection closed with code: ${code}, attempting to reconnect...`);
+  console.log(`🔄 Connection status: ${connection}, Code: ${code || 'N/A'}`);
+
+  // Handle connection closure with specific error codes
+  if (connection === 'close') {
+    console.log(`🔴 Connection closed. Reason: ${lastDisconnect?.error?.message || 'Unknown'}`);
     
-    try {
-      await global.reloadHandler(true).catch(console.error);
-    } catch (error) {
-      console.error('Error reloading handler:', error);
+    if (code === 405) {
+      console.log('⚠️  Code 405: Method Not Allowed - Usually temporary server issue');
+      console.log('🔄 Attempting to reconnect in 5 seconds...');
       
-      // Additional recovery attempt
-      setTimeout(() => {
-        console.log('Attempting to restart connection...');
-        process.send('reset');
+      setTimeout(async () => {
+        try {
+          await global.reloadHandler(true);
+        } catch (error) {
+          console.error('❌ Error in reload handler:', error.message);
+        }
       }, 5000);
     }
-  }
-
-  if (code && (code === DisconnectReason.restartRequired || code === 428)) {
-    console.log(chalk.yellow('\n🌀 Restart Required... Restarting'));
-    process.send('reset');
+    else if (code === DisconnectReason.restartRequired || code === 428) {
+      console.log('🔄 Restart Required... Restarting in 3 seconds');
+      setTimeout(() => process.send('reset'), 3000);
+    }
+    else if (code === DisconnectReason.connectionLost || code === DisconnectReason.connectionReplaced) {
+      console.log('🔄 Connection lost/replaced, reconnecting...');
+      setTimeout(async () => {
+        try {
+          await global.reloadHandler(true);
+        } catch (error) {
+          console.error('❌ Error reconnecting:', error.message);
+        }
+      }, 3000);
+    }
+    else if (code === DisconnectReason.loggedOut) {
+      console.log('❌ Logged out from WhatsApp. Need new session.');
+      clearsession();
+      process.exit(1);
+    }
   }
 
   // Load database if not loaded
@@ -410,46 +459,50 @@ async function connectionUpdate(update) {
     try {
       await loadDatabase();
     } catch (error) {
-      console.error('Error loading database:', error);
+      console.error('❌ Error loading database:', error.message);
     }
   }
 
   if (!pairingCode && useQr && qr !== 0 && qr !== undefined) {
-    console.log(chalk.yellow('\nScan the QR code to login...'));
+    console.log('📱 Scan the QR code to login...');
   }
 
   if (connection === 'open') {
-    console.log(chalk.green('\n✅ Connected successfully!'));
+    console.log('✅ Connected successfully!');
+    connectionAttempts = 0;
     
     try {
-      const { jid, name } = conn.user;
-      const msg = `*TOHID-KHAN Connected* \n\n *Prefix  : [ . ]* \n\n *Plugins : 340* \n\n *SUPPORT BY FOLLOW*
-*https://GitHub.com/Tohidkhan6332*`;
+      const { jid, name } = global.conn.user;
+      const msg = `*TOHID-KHAN Connected* \n\n *Prefix  : [ . ]* \n\n *Plugins : 340* \n\n *SUPPORT BY FOLLOW*\n*https://GitHub.com/Tohidkhan6332*`;
 
-      await conn.sendMessage(jid, { text: msg, mentions: [jid] }, { quoted: null });
-      console.log(chalk.yellow('\n👍 B O T  R E A D Y'));
+      await global.conn.sendMessage(jid, { text: msg, mentions: [jid] }, { quoted: null });
+      console.log('🤖 B O T   R E A D Y');
     } catch (error) {
-      console.error('Error sending connection message:', error);
+      console.error('❌ Error sending connection message:', error.message);
     }
-  }
-
-  if (connection === 'close') {
-    console.log(chalk.yellow(`\nConnection closed. Reason: ${lastDisconnect?.error?.message || 'Unknown'}`));
-    
-    // Attempt to reconnect after a delay
-    setTimeout(() => {
-      console.log(chalk.blue('Attempting to reconnect...'));
-      process.send('reset');
-    }, 5000);
   }
 }
 
+// Enhanced error handlers
 process.on('uncaughtException', error => {
-  console.error('Uncaught Exception:', error);
+  console.error('💥 Uncaught Exception:', error.message);
+  console.error('Stack:', error.stack);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('💥 Unhandled Rejection at:', promise);
+  console.error('Reason:', reason);
+});
+
+// Process signal handlers
+process.on('SIGINT', () => {
+  console.log('\n🛑 Received SIGINT. Shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n🛑 Received SIGTERM. Shutting down gracefully...');
+  process.exit(0);
 });
 
 let isInit = true;
@@ -457,8 +510,9 @@ let handler;
 
 try {
   handler = await import('./handler.js');
+  console.log('✅ Handler loaded successfully');
 } catch (error) {
-  console.error('Error loading handler:', error);
+  console.error('❌ Error loading handler:', error.message);
   process.exit(1);
 }
 
@@ -467,93 +521,134 @@ global.reloadHandler = async function (restartConn) {
     const Handler = await import(`./handler.js?update=${Date.now()}`).catch(console.error);
     if (Handler && Object.keys(Handler).length) {
       handler = Handler;
+      console.log('✅ Handler reloaded successfully');
     }
   } catch (error) {
-    console.error('Error reloading handler:', error);
+    console.error('❌ Error reloading handler:', error.message);
   }
   
   if (restartConn) {
+    console.log('🔄 Restarting connection...');
     const oldChats = global.conn.chats;
+    
     try {
-      global.conn.ws.close();
+      if (global.conn.ws) {
+        global.conn.ws.close();
+      }
     } catch (error) {
-      console.error('Error closing connection:', error);
+      console.error('❌ Error closing connection:', error.message);
     }
     
-    conn.ev.removeAllListeners();
+    // Remove all listeners
+    const events = [
+      'messages.upsert', 'messages.update', 'group-participants.update',
+      'groups.update', 'message.delete', 'presence.update',
+      'connection.update', 'creds.update'
+    ];
     
+    events.forEach(event => {
+      try {
+        global.conn.ev.removeAllListeners(event);
+      } catch (error) {
+        // Ignore errors for events that might not have listeners
+      }
+    });
+    
+    // Create new connection
     try {
       global.conn = makeWASocket(connectionOptions, {
         chats: oldChats,
       });
+      globalConn = global.conn;
+      isInit = true;
+      console.log('✅ New connection created successfully');
     } catch (error) {
-      console.error('Error recreating connection:', error);
-      // Try to reconnect after a delay
-      setTimeout(() => process.send('reset'), 5000);
-      return false;
+      console.error('❌ Error creating new connection:', error.message);
+      throw error;
     }
-    
-    isInit = true;
   }
   
   if (!isInit) {
     // Remove old listeners
-    conn.ev.off('messages.upsert', conn.handler);
-    conn.ev.off('messages.update', conn.pollUpdate);
-    conn.ev.off('group-participants.update', conn.participantsUpdate);
-    conn.ev.off('groups.update', conn.groupsUpdate);
-    conn.ev.off('message.delete', conn.onDelete);
-    conn.ev.off('presence.update', conn.presenceUpdate);
-    conn.ev.off('connection.update', conn.connectionUpdate);
-    conn.ev.off('creds.update', conn.credsUpdate);
+    const events = [
+      'messages.upsert', 'messages.update', 'group-participants.update',
+      'groups.update', 'message.delete', 'presence.update',
+      'connection.update', 'creds.update'
+    ];
+    
+    events.forEach(event => {
+      try {
+        global.conn.ev.off(event);
+      } catch (error) {
+        // Ignore errors for events that might not have listeners
+      }
+    });
   }
 
   // Default messages
-  conn.welcome = ` Hello @user!\n\n🎉 *WELCOME* to the group @group!\n\n📜 Please read the *DESCRIPTION* @desc.`;
-  conn.bye = `👋GOODBYE @user \n\nSee you later!`;
-  conn.spromote = `*@user* has been promoted to an admin!`;
-  conn.sdemote = `*@user* is no longer an admin.`;
-  conn.sDesc = `The group description has been updated to:\n@desc`;
-  conn.sSubject = `The group title has been changed to:\n@group`;
-  conn.sIcon = `The group icon has been updated!`;
-  conn.sRevoke = ` The group link has been changed to:\n@revoke`;
-  conn.sAnnounceOn = `The group is now *CLOSED*!\nOnly admins can send messages.`;
-  conn.sAnnounceOff = `The group is now *OPEN*!\nAll participants can send messages.`;
-  conn.sRestrictOn = `Edit Group Info has been restricted to admins only!`;
-  conn.sRestrictOff = `Edit Group Info is now available to all participants!`;
+  const messageTemplates = {
+    welcome: `Hello @user!\n\n🎉 *WELCOME* to the group @group!\n\n📜 Please read the *DESCRIPTION* @desc.`,
+    bye: `👋 GOODBYE @user \n\nSee you later!`,
+    spromote: `*@user* has been promoted to an admin!`,
+    sdemote: `*@user* is no longer an admin.`,
+    sDesc: `The group description has been updated to:\n@desc`,
+    sSubject: `The group title has been changed to:\n@group`,
+    sIcon: `The group icon has been updated!`,
+    sRevoke: `The group link has been changed to:\n@revoke`,
+    sAnnounceOn: `The group is now *CLOSED*!\nOnly admins can send messages.`,
+    sAnnounceOff: `The group is now *OPEN*!\nAll participants can send messages.`,
+    sRestrictOn: `Edit Group Info has been restricted to admins only!`,
+    sRestrictOff: `Edit Group Info is now available to all participants!`
+  };
+
+  Object.assign(global.conn, messageTemplates);
 
   // Bind handlers
-  conn.handler = handler.handler.bind(global.conn);
-  conn.pollUpdate = handler.pollUpdate.bind(global.conn);
-  conn.participantsUpdate = handler.participantsUpdate.bind(global.conn);
-  conn.groupsUpdate = handler.groupsUpdate.bind(global.conn);
-  conn.onDelete = handler.deleteUpdate.bind(global.conn);
-  conn.presenceUpdate = handler.presenceUpdate.bind(global.conn);
-  conn.connectionUpdate = connectionUpdate.bind(global.conn);
-  conn.credsUpdate = saveCreds.bind(global.conn, true);
+  try {
+    global.conn.handler = handler.handler?.bind(global.conn) || (() => {});
+    global.conn.pollUpdate = handler.pollUpdate?.bind(global.conn) || (() => {});
+    global.conn.participantsUpdate = handler.participantsUpdate?.bind(global.conn) || (() => {});
+    global.conn.groupsUpdate = handler.groupsUpdate?.bind(global.conn) || (() => {});
+    global.conn.onDelete = handler.deleteUpdate?.bind(global.conn) || (() => {});
+    global.conn.presenceUpdate = handler.presenceUpdate?.bind(global.conn) || (() => {});
+    global.conn.connectionUpdate = connectionUpdate.bind(global.conn);
+    global.conn.credsUpdate = saveCreds.bind(global.conn, true);
+  } catch (error) {
+    console.error('❌ Error binding handlers:', error.message);
+  }
 
   // Add event listeners
-  conn.ev.on('messages.upsert', conn.handler);
-  conn.ev.on('messages.update', conn.pollUpdate);
-  conn.ev.on('group-participants.update', conn.participantsUpdate);
-  conn.ev.on('groups.update', conn.groupsUpdate);
-  conn.ev.on('message.delete', conn.onDelete);
-  conn.ev.on('presence.update', conn.presenceUpdate);
-  conn.ev.on('connection.update', conn.connectionUpdate);
-  conn.ev.on('creds.update', conn.credsUpdate);
+  try {
+    global.conn.ev.on('messages.upsert', global.conn.handler);
+    global.conn.ev.on('messages.update', global.conn.pollUpdate);
+    global.conn.ev.on('group-participants.update', global.conn.participantsUpdate);
+    global.conn.ev.on('groups.update', global.conn.groupsUpdate);
+    global.conn.ev.on('message.delete', global.conn.onDelete);
+    global.conn.ev.on('presence.update', global.conn.presenceUpdate);
+    global.conn.ev.on('connection.update', global.conn.connectionUpdate);
+    global.conn.ev.on('creds.update', global.conn.credsUpdate);
+  } catch (error) {
+    console.error('❌ Error adding event listeners:', error.message);
+  }
   
   isInit = false;
   return true;
 };
 
-// Plugin loading with better error handling
+// Plugin loading
 const pluginFolder = global.__dirname(join(__dirname, './plugins/index'));
 const pluginFilter = filename => /\.js$/.test(filename);
 global.plugins = {};
 
 async function filesInit() {
   try {
+    if (!existsSync(pluginFolder)) {
+      console.error('❌ Plugin folder not found:', pluginFolder);
+      return;
+    }
+    
     const files = readdirSync(pluginFolder).filter(pluginFilter);
+    console.log(`📦 Found ${files.length} plugins to load`);
     
     for (const filename of files) {
       try {
@@ -561,16 +656,17 @@ async function filesInit() {
         const module = await import(file);
         global.plugins[filename] = module.default || module;
       } catch (e) {
-        console.error(`Error loading plugin ${filename}:`, e);
+        console.error(`❌ Error loading plugin ${filename}:`, e.message);
         delete global.plugins[filename];
       }
     }
   } catch (error) {
-    console.error('Error reading plugin directory:', error);
+    console.error('❌ Error reading plugin directory:', error.message);
   }
 }
 
 await filesInit();
+console.log(`✅ Loaded ${Object.keys(global.plugins).length} plugins`);
 
 global.reload = async (_ev, filename) => {
   if (pluginFilter(filename)) {
@@ -578,13 +674,13 @@ global.reload = async (_ev, filename) => {
     
     if (filename in global.plugins) {
       if (existsSync(dir)) {
-        console.log(`\nUpdated plugin - '${filename}'`);
+        console.log(`🔄 Updated plugin - '${filename}'`);
       } else {
-        console.log(`\nDeleted plugin - '${filename}'`);
+        console.log(`🗑️ Deleted plugin - '${filename}'`);
         return delete global.plugins[filename];
       }
     } else {
-      console.log(`\nNew plugin - '${filename}'`);
+      console.log(`🆕 New plugin - '${filename}'`);
     }
     
     try {
@@ -594,19 +690,18 @@ global.reload = async (_ev, filename) => {
       });
       
       if (err) {
-        console.error(`\nSyntax error while loading '${filename}':\n${format(err)}`);
+        console.error(`❌ Syntax error in '${filename}':`, format(err));
         return;
       }
       
       const module = await import(`${global.__filename(dir)}?update=${Date.now()}`);
       global.plugins[filename] = module.default || module;
       
-      // Sort plugins alphabetically
       global.plugins = Object.fromEntries(
         Object.entries(global.plugins).sort(([a], [b]) => a.localeCompare(b))
       );
     } catch (e) {
-      console.error(`\nError loading plugin '${filename}':\n${format(e)}`);
+      console.error(`❌ Error loading plugin '${filename}':`, format(e));
     }
   }
 };
@@ -615,74 +710,68 @@ Object.freeze(global.reload);
 
 // Watch for plugin changes
 try {
-  watch(pluginFolder, global.reload);
+  if (existsSync(pluginFolder)) {
+    watch(pluginFolder, global.reload);
+    console.log('👀 Watching for plugin changes');
+  }
 } catch (error) {
-  console.error('Error setting up plugin watcher:', error);
+  console.error('❌ Error setting up plugin watcher:', error.message);
 }
 
-await global.reloadHandler();
+// Initialize connection
+try {
+  await createConnection();
+  await global.reloadHandler();
+  console.log('✅ Bot initialization completed successfully!');
+} catch (error) {
+  console.error('❌ Failed to initialize bot:', error.message);
+  process.exit(1);
+}
 
 // Quick test for dependencies
 async function _quickTest() {
-  const test = await Promise.all(
-    [
-      spawn('ffmpeg'),
-      spawn('ffprobe'),
-      spawn('ffmpeg', [
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-filter_complex',
-        'color',
-        '-frames:v',
-        '1',
-        '-f',
-        'webp',
-        '-',
-      ]),
-      spawn('convert'),
-      spawn('magick'),
-      spawn('gm'),
-      spawn('find', ['--version']),
-    ].map(p => {
-      return Promise.race([
-        new Promise(resolve => {
-          p.on('close', code => {
-            resolve(code !== 127);
-          });
-        }),
-        new Promise(resolve => {
-          p.on('error', _ => resolve(false));
-        }),
-      ]);
-    })
-  );
-  
-  const [ffmpeg, ffprobe, ffmpegWebp, convert, magick, gm, find] = test;
-  const s = (global.support = {
-    ffmpeg,
-    ffprobe,
-    ffmpegWebp,
-    convert,
-    magick,
-    gm,
-    find,
-  });
-  
-  Object.freeze(global.support);
+  try {
+    const test = await Promise.all(
+      [
+        spawn('ffmpeg', ['-version']),
+        spawn('ffprobe', ['-version']),
+        spawn('node', ['--version']),
+      ].map(p => {
+        return Promise.race([
+          new Promise(resolve => {
+            p.on('close', code => {
+              resolve(code === 0);
+            });
+          }),
+          new Promise(resolve => {
+            p.on('error', _ => resolve(false));
+          }),
+        ]);
+      })
+    );
+    
+    const [ffmpeg, ffprobe, node] = test;
+    global.support = { ffmpeg, ffprobe, node };
+    Object.freeze(global.support);
+    
+    console.log('✅ Dependency check completed');
+  } catch (error) {
+    console.error('❌ Dependency check failed:', error.message);
+  }
 }
 
 // Session cleanup function
-async function saafsafai() {
-  if (global.stopped === 'close' || !conn || !conn.user) return;
+async function cleanupSessions() {
+  if (global.stopped === 'close' || !global.conn || !global.conn.user) return;
   clearsession();
-  console.log(chalk.cyanBright('\nStored Sessions Cleared'));
+  console.log('🧹 Session files cleaned up');
 }
 
-// Run session cleanup every 15 minutes instead of 10
-setInterval(saafsafai, 15 * 60 * 1000);
+// Run session cleanup every 30 minutes
+setInterval(cleanupSessions, 1800000);
 
 // Run quick test
 _quickTest().catch(console.error);
 
-console.log(chalk.green('Bot initialization completed successfully!'));
+// Export for external use
+export { globalConn as conn };
