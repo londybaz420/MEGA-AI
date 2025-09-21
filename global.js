@@ -113,11 +113,34 @@ global.prefix = new RegExp(
     ']'
 )
 global.opts['db'] = process.env.MONGODB_URI
+// SAVE  SESSION CREDS
+
+async function saveCredsToSession(sessionId, creds) {
+  try {
+    const { MongoClient } = await import('mongodb');
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+
+    const db = client.db(DB_NAME);
+    const sessionsCollection = db.collection('sessions');
+
+    // Upsert (insert if not exists, update if exists)
+    await sessionsCollection.updateOne(
+      { sessionId },
+      { $set: { data: creds } },
+      { upsert: true }
+    );
+
+    await client.close();
+    console.log(chalk.green(`✓ Credentials saved for session: ${sessionId}`));
+  } catch (error) {
+    console.error(chalk.red('✗ Error saving credentials:'), error.message);
+  }
+}
 
 // Function to load credentials from MongoDB using session ID
 async function loadCredsFromSession(sessionId) {
   try {
-    // Connect to MongoDB
     const { MongoClient } = await import('mongodb');
     const client = new MongoClient(MONGODB_URI);
     await client.connect();
@@ -125,23 +148,17 @@ async function loadCredsFromSession(sessionId) {
     const db = client.db(DB_NAME);
     const sessionsCollection = db.collection('sessions');
     
-    // Find session data by session ID
     const sessionData = await sessionsCollection.findOne({ sessionId });
-    
     await client.close();
     
     if (!sessionData) {
       throw new Error(`No session found with ID: ${sessionId}`);
     }
-    
-    // Yahan direct sessionData return ho raha hai
+
     console.log(chalk.green(`✓ Successfully loaded credentials for session: ${sessionId}`));
-    return sessionData;
-    
+    return sessionData.data; // pura creds.json return karega
   } catch (error) {
     console.error(chalk.red('✗ Error loading credentials from session:'), error.message);
-    
-    // If no session found, try to use default auth state
     console.log(chalk.yellow('ℹ Attempting to use default authentication...'));
     return null;
   }
@@ -149,8 +166,13 @@ async function loadCredsFromSession(sessionId) {
 
 // Load credentials from session
 let credsData = null;
+
 try {
-  credsData = await loadCredsFromSession(sessionIdFromEnv);
+
+await saveCredsToSession(edith, sessionIdFronEnv);
+ 
+  credsData = await loadCredsFromSession(edith);
+  
 } catch (error) {
   console.log(chalk.yellow('ℹ Could not load session, using default authentication'));
 }
