@@ -51,7 +51,7 @@ const {
   proto,
   delay,
   jidNormalizedUser,
-} = await (await import('@whiskeysockets/baileys')).default;
+} = await (await import('baileys-pro')).default;
 
 import readline from 'readline';
 import os from 'os';
