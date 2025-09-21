@@ -261,7 +261,7 @@ conn.ev.on('creds.update', async (creds) => {
 });
 
 // Start the bot directly with session credentials
-function startBot() {
+async function startBot() {
   if (!opts['test']) {
     if (global.db) {
       setInterval(async () => {
