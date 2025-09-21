@@ -78,9 +78,12 @@ setInterval(async () => {
 
 await global.loadDatabase()
 
-
-const sessdata = process.env.SESSION_ID.replace("EDITH-MD~", '');
-const sessionIdFromEnv = Buffer.from(sessdata, 'base64').toString('utf-8');
+// Check if SESSION_ID exists and extract properly
+const sessionIdFromEnv = process.env.SESSION_ID ? 
+  (process.env.SESSION_ID.includes("EDITH-MD~") 
+    ? Buffer.from(process.env.SESSION_ID.replace("EDITH-MD~", ''), 'base64').toString('utf-8')
+    : process.env.SESSION_ID) 
+  : 'default_session';
 
 const MAIN_LOGGER = pino({ timestamp: () => `,"time":"${new Date().toJSON()}"` })
 
@@ -113,9 +116,9 @@ global.prefix = new RegExp(
     ']'
 )
 global.opts['db'] = process.env.MONGODB_URI
-// SAVE  SESSION CREDS
 
-async function saveCredsToSession(sessionId, creds) {
+// Single function to save credentials to MongoDB
+async function saveSessionToMongo(sessionId, creds) {
   try {
     const { MongoClient } = await import('mongodb');
     const client = new MongoClient(MONGODB_URI);
@@ -127,14 +130,14 @@ async function saveCredsToSession(sessionId, creds) {
     // Upsert (insert if not exists, update if exists)
     await sessionsCollection.updateOne(
       { sessionId },
-      { $set: { data: creds } },
+      { $set: { sessionId, data: creds, updatedAt: new Date() } },
       { upsert: true }
     );
 
     await client.close();
-    console.log(chalk.green(`✓ Credentials saved for session: ${sessionId}`));
+    console.log(chalk.green(`✓ Session saved: ${sessionId}`));
   } catch (error) {
-    console.error(chalk.red('✗ Error saving credentials:'), error.message);
+    console.error(chalk.red('✗ Error saving session:'), error.message);
   }
 }
 
@@ -151,45 +154,46 @@ async function loadCredsFromSession(sessionId) {
     const sessionData = await sessionsCollection.findOne({ sessionId });
     await client.close();
     
-    if (!sessionData) {
-      throw new Error(`No session found with ID: ${sessionId}`);
+    if (!sessionData || !sessionData.data) {
+      console.log(chalk.yellow(`ℹ No session data found for ID: ${sessionId}`));
+      return null;
     }
 
-    console.log(chalk.green(`✓ Successfully loaded credentials for session: ${sessionId}`));
-    return sessionData.data; // pura creds.json return karega
+    console.log(chalk.green(`✓ Session loaded: ${sessionId}`));
+    return sessionData.data;
   } catch (error) {
-    console.error(chalk.red('✗ Error loading credentials from session:'), error.message);
-    console.log(chalk.yellow('ℹ Attempting to use default authentication...'));
+    console.error(chalk.red('✗ Error loading session:'), error.message);
     return null;
   }
 }
 
-// Load credentials from session
-let credsData = null;
-
-try {
-
-await saveCredsToSession(edith, sessionIdFronEnv);
- 
-  credsData = await loadCredsFromSession(edith);
-  
-} catch (error) {
-  console.log(chalk.yellow('ℹ Could not load session, using default authentication'));
-}
-
+// Initialize auth state with MongoDB
 const { state, saveCreds, closeConnection } = await useMongoDBAuthState(MONGODB_URI, DB_NAME)
 
-// If we have credsData from session, use it to override the auth state
-if (credsData && state.creds) {
-  state.creds = { ...state.creds, ...credsData };
-  console.log(chalk.green('✓ Session credentials applied successfully'));
+// Try to load session from environment variable if available
+let loadedCreds = null;
+if (process.env.SESSION_ID) {
+  loadedCreds = await loadCredsFromSession(sessionIdFromEnv);
+  
+  if (loadedCreds) {
+    // Override the state with loaded credentials
+    state.creds = loadedCreds;
+    console.log(chalk.green('✓ Session credentials applied successfully'));
+  } else {
+    console.log(chalk.yellow('ℹ No existing session found, starting fresh session'));
+    
+    // If we have a SESSION_ID but no saved session, save the initial state
+    if (state.creds) {
+      await saveSessionToMongo(sessionIdFromEnv, state.creds);
+    }
+  }
 }
 
 const connectionOptions = {
   logger: Pino({
     level: 'silent',
   }),
-  printQRInTerminal: false,
+  printQRInTerminal: !loadedCreds, // Only show QR if no session was loaded
   version: [2, 3000, 1023223821],
   browser: Browsers.ubuntu('Chrome'),
   auth: {
@@ -249,30 +253,6 @@ const connectionOptions = {
 
 global.conn = makeWASocket(connectionOptions)
 conn.isInit = false
-
-// Function to save session data to MongoDB
-async function saveSessionToMongo(sessionId, credsData) {
-  try {
-    const { MongoClient } = await import('mongodb');
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    
-    const db = client.db(DB_NAME);
-    const sessionsCollection = db.collection('sessions');
-    
-    // Upsert session data
-    await sessionsCollection.updateOne(
-      { sessionId },
-      { $set: { sessionId, creds: credsData, updatedAt: new Date() } },
-      { upsert: true }
-    );
-    
-    await client.close();
-    console.log(chalk.green(`✓ Session saved to MongoDB with ID: ${sessionId}`));
-  } catch (error) {
-    console.error(chalk.red('✗ Error saving session to MongoDB:'), error.message);
-  }
-}
 
 // Listen for credential updates to save the session
 conn.ev.on('creds.update', async (creds) => {
