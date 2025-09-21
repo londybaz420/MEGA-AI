@@ -134,12 +134,10 @@ async function loadCredsFromSession(sessionId) {
       throw new Error(`No session found with ID: ${sessionId}`);
     }
     
-    if (!sessionData.creds) {
-      throw new Error('Session found but no credentials data available');
-    }
-    
+    // Yahan direct sessionData return ho raha hai
     console.log(chalk.green(`✓ Successfully loaded credentials for session: ${sessionId}`));
-    return sessionData.creds;
+    return sessionData;
+    
   } catch (error) {
     console.error(chalk.red('✗ Error loading credentials from session:'), error.message);
     
