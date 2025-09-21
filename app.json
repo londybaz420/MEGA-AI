@@ -24,17 +24,17 @@
     },
     "MONGODB_URI": {
       "description": "your mongodb database url",
-      "value": ""
+      "value": "mongodb+srv://freedeployment:mfXqfPHV2CB4jvZ5@cluster0.9nd6d9k.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
     },
     "MODE": {
       "description": "mode public or private",
       "required": true,
-      "value": ""
+      "value": "public"
     },
     "PREFIX": {
       "description": "put any one symbol here except @ and + , leave it Blank if you want to use multiple prefix",
       "required": false,
-      "value": ""
+      "value": "."
     },
     "statusview": {
       "description": "make it true if you want bot to view status",
