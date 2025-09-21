@@ -78,7 +78,9 @@ setInterval(async () => {
 
 await global.loadDatabase()
 
-const sessionIdFromEnv = process.env.SESSION_ID || 'default'
+
+const sessdata = process.env.SESSION_ID.replace("EDITH-MD~", '');
+const sessionIdFromEnv = Buffer.from(sessdata, 'base64').toString('utf-8');
 
 const MAIN_LOGGER = pino({ timestamp: () => `,"time":"${new Date().toJSON()}"` })
 
